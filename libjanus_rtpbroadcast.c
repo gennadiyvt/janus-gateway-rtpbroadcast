@@ -169,13 +169,13 @@ const char *cm_rtpbcast_get_name(void);
 const char *cm_rtpbcast_get_author(void);
 const char *cm_rtpbcast_get_package(void);
 void cm_rtpbcast_create_session(janus_plugin_session *handle, int *error);
-struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *handle, char *transaction, char *message, char *sdp_type, char *sdp);
+struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep);
 void cm_rtpbcast_setup_media(janus_plugin_session *handle);
 void cm_rtpbcast_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len);
 void cm_rtpbcast_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len);
 void cm_rtpbcast_hangup_media(janus_plugin_session *handle);
 void cm_rtpbcast_destroy_session(janus_plugin_session *handle, int *error);
-char *cm_rtpbcast_query_session(janus_plugin_session *handle);
+json_t *cm_rtpbcast_query_session(janus_plugin_session *handle);
 
 /* Plugin setup */
 static janus_plugin cm_rtpbcast_plugin =
@@ -208,6 +208,63 @@ janus_plugin *create(void) {
 }
 
 typedef struct cm_rtpbcast_rtp_source cm_rtpbcast_rtp_source;
+
+/* Parameter validation */
+static struct janus_json_parameter request_parameters[] = {
+	{"request", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
+};
+static struct janus_json_parameter id_parameters[] = {
+	{"id", JSON_INTEGER, JANUS_JSON_PARAM_REQUIRED | JANUS_JSON_PARAM_POSITIVE}
+};
+static struct janus_json_parameter adminkey_parameters[] = {
+	{"admin_key", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
+};
+static struct janus_json_parameter create_parameters[] = {
+	{"type", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
+	{"secret", JSON_STRING, 0},
+	{"pin", JSON_STRING, 0},
+	{"permanent", JANUS_JSON_BOOL, 0}
+};
+static struct janus_json_parameter rtp_parameters[] = {
+	{"id", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"name", JSON_STRING, 0},
+	{"description", JSON_STRING, 0},
+	{"is_private", JANUS_JSON_BOOL, 0},
+	{"audio", JANUS_JSON_BOOL, 0},
+	{"video", JANUS_JSON_BOOL, 0}
+};
+static struct janus_json_parameter live_parameters[] = {
+	{"id", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"name", JSON_STRING, 0},
+	{"description", JSON_STRING, 0},
+	{"is_private", JANUS_JSON_BOOL, 0},
+	{"filename", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
+	{"audio", JANUS_JSON_BOOL, 0},
+	{"video", JANUS_JSON_BOOL, 0}
+};
+static struct janus_json_parameter ondemand_parameters[] = {
+	{"id", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"name", JSON_STRING, 0},
+	{"description", JSON_STRING, 0},
+	{"is_private", JANUS_JSON_BOOL, 0},
+	{"filename", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
+	{"audio", JANUS_JSON_BOOL, 0},
+	{"video", JANUS_JSON_BOOL, 0}
+};
+#ifdef HAVE_LIBCURL
+static struct janus_json_parameter rtsp_parameters[] = {
+	{"id", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"name", JSON_STRING, 0},
+	{"description", JSON_STRING, 0},
+	{"is_private", JANUS_JSON_BOOL, 0},
+	{"url", JSON_STRING, 0},
+	{"rtsp_user", JSON_STRING, 0},
+	{"rtsp_pwd", JSON_STRING, 0},
+	{"audio", JANUS_JSON_BOOL, 0},
+	{"video", JANUS_JSON_BOOL, 0},
+	{"rtspiface", JSON_STRING, 0}
+};
+#endif
 
 /* Useful stuff */
 static volatile gint initialized = 0, stopping = 0;
@@ -448,8 +505,7 @@ typedef struct cm_rtpbcast_message {
 	janus_plugin_session *handle;
 	char *transaction;
 	json_t *message;
-	char *sdp_type;
-	char *sdp;
+	json_t *jsep;
 } cm_rtpbcast_message;
 static GAsyncQueue *messages = NULL;
 
@@ -465,10 +521,9 @@ void cm_rtpbcast_message_free(cm_rtpbcast_message *msg) {
 	if(msg->message)
 		json_decref(msg->message);
 	msg->message = NULL;
-	g_free(msg->sdp_type);
-	msg->sdp_type = NULL;
-	g_free(msg->sdp);
-	msg->sdp = NULL;
+	if(msg->jsep)
+		json_decref(msg->jsep);
+	msg->jsep = NULL;
 
 	g_free(msg);
 }
@@ -694,8 +749,7 @@ void *cm_rtpbcast_watchdog(void *data) {
 						json_object_set_new(result, "config", config);
 
 						json_object_set_new(event, "result", result);
-						char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
-						gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event_text, NULL, NULL);
+						gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event, NULL);
 					}
 				}
 			}
@@ -1030,11 +1084,6 @@ void cm_rtpbcast_create_session(janus_plugin_session *handle, int *error) {
 
 	cm_rtpbcast_session *session = (cm_rtpbcast_session *)g_malloc0(sizeof(cm_rtpbcast_session));
 
-	if(session == NULL) {
-		JANUS_LOG(LOG_FATAL, "Memory error!\n");
-		*error = -2;
-		return;
-	}
 	session->handle = handle;
 	session->source = NULL;	/* This will happen later */
 	session->nextsource = NULL;
@@ -1124,7 +1173,7 @@ void cm_rtpbcast_destroy_session(janus_plugin_session *handle, int *error) {
 	return;
 }
 
-char *cm_rtpbcast_query_session(janus_plugin_session *handle) {
+json_t *cm_rtpbcast_query_session(janus_plugin_session *handle) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
 		return NULL;
 	}
@@ -1142,19 +1191,17 @@ char *cm_rtpbcast_query_session(janus_plugin_session *handle) {
 		json_object_set_new(info, "mountpoint_name", session->source->mp->name ? json_string(session->source->mp->name) : NULL);
 	}
 	json_object_set_new(info, "destroyed", json_integer(session->destroyed));
-	char *info_text = json_dumps(info, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
-	json_decref(info);
-	return info_text;
+	return info;
 }
 
-struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *handle, char *transaction, char *message, char *sdp_type, char *sdp) {
+struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
-		return janus_plugin_result_new(JANUS_PLUGIN_ERROR, g_atomic_int_get(&stopping) ? "Shutting down" : "Plugin not initialized");
+		return janus_plugin_result_new(JANUS_PLUGIN_ERROR, g_atomic_int_get(&stopping) ? "Shutting down" : "Plugin not initialized", NULL);
 
 	/* Pre-parse the message */
 	int error_code = 0;
 	char error_cause[512];
-	json_t *root = NULL;
+	json_t *root = message;
 	json_t *response = NULL;
 
 	/* This might need to be freed at error: label */
@@ -1164,51 +1211,35 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 		JANUS_LOG(LOG_ERR, "No message??\n");
 		error_code = CM_RTPBCAST_ERROR_NO_MESSAGE;
 		g_snprintf(error_cause, 512, "%s", "No message??");
-		goto error;
+		goto plugin_response;
 	}
-	JANUS_LOG(LOG_VERB, "Handling message: %s\n", message);
 
 	cm_rtpbcast_session *session = (cm_rtpbcast_session *)handle->plugin_handle;
 	if(!session) {
 		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 		error_code = CM_RTPBCAST_ERROR_UNKNOWN_ERROR;
 		g_snprintf(error_cause, 512, "%s", "session associated with this handle...");
-		goto error;
+		goto plugin_response;
 	}
 	if(session->destroyed) {
 		JANUS_LOG(LOG_ERR, "Session has already been destroyed...\n");
 		error_code = CM_RTPBCAST_ERROR_UNKNOWN_ERROR;
 		g_snprintf(error_cause, 512, "%s", "Session has already been destroyed...");
-		goto error;
-	}
-	json_error_t error;
-	root = json_loads(message, 0, &error);
-	if(!root) {
-		JANUS_LOG(LOG_ERR, "JSON error: on line %d: %s\n", error.line, error.text);
-		error_code = CM_RTPBCAST_ERROR_INVALID_JSON;
-		g_snprintf(error_cause, 512, "JSON error: on line %d: %s", error.line, error.text);
-		goto error;
+		goto plugin_response;
 	}
 	if(!json_is_object(root)) {
 		JANUS_LOG(LOG_ERR, "JSON error: not an object\n");
 		error_code = CM_RTPBCAST_ERROR_INVALID_JSON;
 		g_snprintf(error_cause, 512, "JSON error: not an object");
-		goto error;
+		goto plugin_response;
 	}
 	/* Get the request first */
+	JANUS_VALIDATE_JSON_OBJECT(root, request_parameters,
+		error_code, error_cause, TRUE,
+		CM_RTPBCAST_ERROR_MISSING_ELEMENT, CM_RTPBCAST_ERROR_INVALID_ELEMENT);
+	if(error_code != 0)
+		goto plugin_response;
 	json_t *request = json_object_get(root, "request");
-	if(!request) {
-		JANUS_LOG(LOG_ERR, "Missing element (request)\n");
-		error_code = CM_RTPBCAST_ERROR_MISSING_ELEMENT;
-		g_snprintf(error_cause, 512, "Missing element (request)");
-		goto error;
-	}
-	if(!json_is_string(request)) {
-		JANUS_LOG(LOG_ERR, "Invalid element (request should be a string)\n");
-		error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
-		g_snprintf(error_cause, 512, "Invalid element (request should be a string)");
-		goto error;
-	}
 	/* Some requests ('create' and 'destroy') can be handled synchronously */
 	const char *request_text = json_string_value(request);
 	if(!strcasecmp(request_text, "superuser")) {
@@ -1218,13 +1249,13 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 			JANUS_LOG(LOG_ERR, "Missing element (value)\n");
 			error_code = CM_RTPBCAST_ERROR_MISSING_ELEMENT;
 			g_snprintf(error_cause, 512, "Missing element (value)");
-			goto error;
+			goto plugin_response;
 		}
 		if(!json_is_boolean(value)) {
 			JANUS_LOG(LOG_ERR, "Invalid element (value should be boolean)\n");
 			error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 			g_snprintf(error_cause, 512, "Invalid element (value should be boolean)");
-			goto error;
+			goto plugin_response;
 		}
 
 		gboolean su = json_is_true(value);
@@ -1248,7 +1279,7 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 			JANUS_LOG(LOG_ERR, "Invalid element (id should be a string)\n");
 			error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 			g_snprintf(error_cause, 512, "Invalid element (id should be a string)");
-			goto error;
+			goto plugin_response;
 		}
 
 		/* Send info back */
@@ -1266,41 +1297,41 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 			JANUS_LOG(LOG_ERR, "Missing element (id)\n");
 			error_code = CM_RTPBCAST_ERROR_MISSING_ELEMENT;
 			g_snprintf(error_cause, 512, "Missing element (id)");
-			goto error;
+			goto plugin_response;
 		}
 		if(!json_is_string(id)) {
 			JANUS_LOG(LOG_ERR, "Invalid element (id should be a string)\n");
 			error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 			g_snprintf(error_cause, 512, "Invalid element (id should be a string)");
-			goto error;
+			goto plugin_response;
 		}
 		json_t *name = json_object_get(root, "name");
 		if(name && !json_is_string(name)) {
 			JANUS_LOG(LOG_ERR, "Invalid element (name should be a string)\n");
 			error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 			g_snprintf(error_cause, 512, "Invalid element (name should be a string)");
-			goto error;
+			goto plugin_response;
 		}
 		json_t *desc = json_object_get(root, "description");
 		if(desc && !json_is_string(desc)) {
 			JANUS_LOG(LOG_ERR, "Invalid element (desc should be a string)\n");
 			error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 			g_snprintf(error_cause, 512, "Invalid element (desc should be a string)");
-			goto error;
+			goto plugin_response;
 		}
 		json_t *recorded = json_object_get(root, "recorded");
 		if(recorded && !json_is_boolean(recorded)) {
 			JANUS_LOG(LOG_ERR, "Invalid element (recorded should be a boolean)\n");
 			error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 			g_snprintf(error_cause, 512, "Invalid element (recorded should be a boolean)");
-			goto error;
+			goto plugin_response;
 		}
 		json_t *whitelist = json_object_get(root, "whitelist");
 		if(whitelist && !json_is_string(whitelist)) {
 			JANUS_LOG(LOG_ERR, "Invalid element (whitelist should be a string)\n");
 			error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 			g_snprintf(error_cause, 512, "Invalid element (whitelist should be a string)");
-			goto error;
+			goto plugin_response;
 		}
 
 		/* Streams is an array now, containing pairs of audio+video streams */
@@ -1310,7 +1341,7 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 			JANUS_LOG(LOG_ERR, "Invalid element (streams should be a non-empty array)\n");
 			error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 			g_snprintf(error_cause, 512, "Invalid element (streams should be a non-empty array)");
-			goto error;
+			goto plugin_response;
 		}
 
 		sources = g_array_sized_new(FALSE, FALSE,
@@ -1329,7 +1360,7 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 				JANUS_LOG(LOG_ERR, "Invalid element (streams elements should be objects)\n");
 				error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 				g_snprintf(error_cause, 512, "Invalid value (streams elements should be objects)");
-				goto error;
+				goto plugin_response;
 			}
 
 			cm_rtpbcast_rtp_source_request req = {
@@ -1350,7 +1381,7 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 					JANUS_LOG(LOG_ERR, "Invalid element (%s should be a string)\n", tmpnm);
 					error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 					g_snprintf(error_cause, 512, "Invalid element (%s should be a string)", tmpnm);
-					goto error;
+					goto plugin_response;
 				} else {
 					req.mcast[j] = (char *)json_string_value(mcast);
 				}
@@ -1361,13 +1392,13 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 					JANUS_LOG(LOG_ERR, "Missing element (%s)\n", tmpnm);
 					error_code = CM_RTPBCAST_ERROR_MISSING_ELEMENT;
 					g_snprintf(error_cause, 512, "Missing element (%s)", tmpnm);
-					goto error;
+					goto plugin_response;
 				}
 				if(!json_is_integer(pt) || json_integer_value(pt) < 0) {
 					JANUS_LOG(LOG_ERR, "Invalid element (%s should be a positive integer)\n", tmpnm);
 					error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 					g_snprintf(error_cause, 512, "Invalid element (%s should be a positive integer)", tmpnm);
-					goto error;
+					goto plugin_response;
 				}
 				req.codec[j] = json_integer_value(pt);
 
@@ -1377,13 +1408,13 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 					JANUS_LOG(LOG_ERR, "Missing element (%s)\n", tmpnm);
 					error_code = CM_RTPBCAST_ERROR_MISSING_ELEMENT;
 					g_snprintf(error_cause, 512, "Missing element (%s)", tmpnm);
-					goto error;
+					goto plugin_response;
 				}
 				if(!json_is_string(rtpmap)) {
 					JANUS_LOG(LOG_ERR, "Invalid element (%s should be a string)\n", tmpnm);
 					error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 					g_snprintf(error_cause, 512, "Invalid element (%s should be a string)", tmpnm);
-					goto error;
+					goto plugin_response;
 				}
 				req.rtpmap[j] = (char *)json_string_value(rtpmap);
 
@@ -1393,7 +1424,7 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 					JANUS_LOG(LOG_ERR, "Invalid element (%s should be a string)\n", tmpnm);
 					error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 					g_snprintf(error_cause, 512, "Invalid element (%s should be a string)", tmpnm);
-					goto error;
+					goto plugin_response;
 				}
 				req.fmtp[j] = (char *)json_string_value(fmtp);
 			}
@@ -1410,7 +1441,7 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 				JANUS_LOG(LOG_ERR, "A stream with the provided ID already exists\n");
 				error_code = CM_RTPBCAST_ERROR_CANT_CREATE;
 				g_snprintf(error_cause, 512, "A stream with the provided ID already exists");
-				goto error;
+				goto plugin_response;
 			}
 		}
 		mp = cm_rtpbcast_create_rtp_source(
@@ -1424,7 +1455,7 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 			JANUS_LOG(LOG_ERR, "Error creating 'rtp' stream...\n");
 			error_code = CM_RTPBCAST_ERROR_CANT_CREATE;
 			g_snprintf(error_cause, 512, "Error creating 'rtp' stream");
-			goto error;
+			goto plugin_response;
 		}
 
 		/* Associate mp with session */
@@ -1474,13 +1505,13 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 			JANUS_LOG(LOG_ERR, "Missing element (id)\n");
 			error_code = CM_RTPBCAST_ERROR_MISSING_ELEMENT;
 			g_snprintf(error_cause, 512, "Missing element (id)");
-			goto error;
+			goto plugin_response;
 		}
 		if(!json_is_string(id) < 0) {
 			JANUS_LOG(LOG_ERR, "Invalid element (id should be a string)\n");
 			error_code = CM_RTPBCAST_ERROR_INVALID_ELEMENT;
 			g_snprintf(error_cause, 512, "Invalid element (id should be a string)");
-			goto error;
+			goto plugin_response;
 		}
 		const char *id_value = json_string_value(id);
 		janus_mutex_lock(&mountpoints_mutex);
@@ -1490,7 +1521,7 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 			JANUS_LOG(LOG_VERB, "No such mountpoint/stream %s\n", id_value);
 			error_code = CM_RTPBCAST_ERROR_NO_SUCH_MOUNTPOINT;
 			g_snprintf(error_cause, 512, "No such mountpoint/stream %s", id_value);
-			goto error;
+			goto plugin_response;
 		}
 		janus_mutex_unlock(&mountpoints_mutex);
 		JANUS_LOG(LOG_INFO, "[%s] Request to unmount mountpoint/stream\n", id_value);
@@ -1514,76 +1545,43 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 			|| !strcasecmp(request_text, "switch") || !strcasecmp(request_text, "switch-source")) {
 		/* These messages are handled asynchronously */
 		cm_rtpbcast_message *msg = g_malloc0(sizeof(cm_rtpbcast_message));
-		if(msg == NULL) {
-			JANUS_LOG(LOG_FATAL, "Memory error!\n");
-			error_code = CM_RTPBCAST_ERROR_UNKNOWN_ERROR;
-			g_snprintf(error_cause, 512, "Memory error");
-			goto error;
-		}
 
-		g_free(message);
 		msg->handle = handle;
 		msg->transaction = transaction;
 		msg->message = root;
-		msg->sdp_type = sdp_type;
-		msg->sdp = sdp;
+		msg->jsep = jsep;
 
 		g_async_queue_push(messages, msg);
 
-		return janus_plugin_result_new(JANUS_PLUGIN_OK_WAIT, NULL);
+		return janus_plugin_result_new(JANUS_PLUGIN_OK_WAIT, NULL, NULL);
 	} else {
 		JANUS_LOG(LOG_VERB, "Unknown request '%s'\n", request_text);
 		error_code = CM_RTPBCAST_ERROR_INVALID_REQUEST;
 		g_snprintf(error_cause, 512, "Unknown request '%s'", request_text);
-		goto error;
 	}
 
 plugin_response:
 		{
-			if(!response) {
+			if (error_code == 0 && !response) {
 				error_code = CM_RTPBCAST_ERROR_UNKNOWN_ERROR;
 				g_snprintf(error_cause, 512, "Invalid response");
-				goto error;
+			}
+
+			if(error_code != 0) {
+				/* Prepare JSON error event */
+				json_t *event = json_object();
+				json_object_set_new(event, "streaming", json_string("event"));
+				json_object_set_new(event, "error_code", json_integer(error_code));
+				json_object_set_new(event, "error", json_string(error_cause));
+				response = event;
 			}
 			if(root != NULL)
 				json_decref(root);
+			if(jsep != NULL)
+				json_decref(jsep);                      
 			g_free(transaction);
-			g_free(message);
-			g_free(sdp_type);
-			g_free(sdp);
-
-			if (sources != NULL)
-				g_array_free(sources, TRUE);
-
-			char *response_text = json_dumps(response, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
-			json_decref(response);
-			janus_plugin_result *result = janus_plugin_result_new(JANUS_PLUGIN_OK, response_text);
-			g_free(response_text);
-			return result;
-		}
-
-error:
-		{
-			if(root != NULL)
-				json_decref(root);
-			g_free(transaction);
-			g_free(message);
-			g_free(sdp_type);
-			g_free(sdp);
-
-			if (sources != NULL)
-				g_array_free(sources, TRUE);
-
-			/* Prepare JSON error event */
-			json_t *event = json_object();
-			json_object_set_new(event, "streaming", json_string("event"));
-			json_object_set_new(event, "error_code", json_integer(error_code));
-			json_object_set_new(event, "error", json_string(error_cause));
-			char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
-			json_decref(event);
-			janus_plugin_result *result = janus_plugin_result_new(JANUS_PLUGIN_OK, event_text);
-			g_free(event_text);
-			return result;
+				
+			return janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, response);
 		}
 
 }
@@ -1610,12 +1608,9 @@ void cm_rtpbcast_setup_media(janus_plugin_session *handle) {
 	json_t *result = json_object();
 	json_object_set_new(result, "status", json_string("started"));
 	json_object_set_new(event, "result", result);
-	char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
-	json_decref(event);
-	JANUS_LOG(LOG_VERB, "Pushing event: %s\n", event_text);
-	int ret = gateway->push_event(handle, &cm_rtpbcast_plugin, NULL, event_text, NULL, NULL);
-	JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
-	g_free(event_text);
+	int ret = gateway->push_event(handle, &cm_rtpbcast_plugin, NULL, event, NULL);
+	JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (%s)\n", ret, janus_get_api_error(ret));
+        json_decref(event);
 }
 
 void cm_rtpbcast_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len) {
@@ -1699,10 +1694,9 @@ void cm_rtpbcast_hangup_media(janus_plugin_session *handle) {
 	/* FIXME Simulate a "stop" coming from the browser */
 	cm_rtpbcast_message *msg = g_malloc0(sizeof(cm_rtpbcast_message));
 	msg->handle = handle;
-	msg->message = json_loads("{\"request\":\"stop\"}", 0, NULL);
+	msg->message = json_pack("{ss}", "request", "stop");
 	msg->transaction = NULL;
-	msg->sdp_type = NULL;
-	msg->sdp = NULL;
+	msg->jsep = NULL;
 	g_async_queue_push(messages, msg);
 }
 
@@ -2140,23 +2134,23 @@ static void *cm_rtpbcast_handler(void *data) {
 		}
 
 		/* Any SDP to handle? */
-		if(msg->sdp) {
-			JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well (but we really don't care):\n%s\n", msg->sdp_type, msg->sdp);
+		const char *msg_sdp_type = json_string_value(json_object_get(msg->jsep, "type"));
+		const char *msg_sdp = json_string_value(json_object_get(msg->jsep, "sdp"));
+		if(msg_sdp) {
+			JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well (but we really don't care):\n%s\n", msg_sdp_type, msg_sdp);
 		}
 
 		/* Prepare JSON event */
+		json_t *jsep = json_pack("{ssss}", "type", sdp_type, "sdp", sdp);
 		json_t *event = json_object();
 		json_object_set_new(event, "streaming", json_string("event"));
 		if(result != NULL)
 			json_object_set_new(event, "result", result);
-		char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
+		int ret = gateway->push_event(msg->handle, &cm_rtpbcast_plugin, msg->transaction, event, jsep);
+		JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (%s)\n", ret, janus_get_api_error(ret));
+		g_free(sdp);
 		json_decref(event);
-		JANUS_LOG(LOG_VERB, "Pushing event: %s\n", event_text);
-		int ret = gateway->push_event(msg->handle, &cm_rtpbcast_plugin, msg->transaction, event_text, sdp_type, sdp);
-		JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
-		g_free(event_text);
-		if(sdp)
-			g_free(sdp);
+		json_decref(jsep);
 		cm_rtpbcast_message_free(msg);
 		continue;
 
@@ -2167,12 +2161,9 @@ error:
 			json_object_set_new(event, "streaming", json_string("event"));
 			json_object_set_new(event, "error_code", json_integer(error_code));
 			json_object_set_new(event, "error", json_string(error_cause));
-			char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
+			int ret = gateway->push_event(msg->handle, &cm_rtpbcast_plugin, msg->transaction, event, NULL);
+			JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (%s)\n", ret, janus_get_api_error(ret));
 			json_decref(event);
-			JANUS_LOG(LOG_VERB, "Pushing event: %s\n", event_text);
-			int ret = gateway->push_event(msg->handle, &cm_rtpbcast_plugin, msg->transaction, event_text, NULL, NULL);
-			JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
-			g_free(event_text);
 			cm_rtpbcast_message_free(msg);
 		}
 	}
@@ -3048,7 +3039,8 @@ cm_rtpbcast_rtp_source* cm_rtpbcast_pick_source(GArray *sources, guint64 remb) {
 		janus_mutex_unlock(&src->stats[VIDEO].stat_mutex);
 
 		/* If current bitrate for any stream is not calculated (-1, null), let's reset current lookup state */
-		if (source_bw || source_bw == -1) {
+		//if (source_bw || source_bw == -1) {
+                if ((source_bw == NULL) || (source_bw == -1)) {
 			is_stream_stats_available = FALSE;
 			best_src = NULL;
 			break;
@@ -3151,6 +3143,22 @@ void cm_rtpbcast_store_event(json_t* response, const char *event_name) {
 }
 
 /* Generic functions for both recording and thumbnailing */
+static void cm_rtpbcast_generic_get_codecs(cm_rtpbcast_rtp_source *src, char *codecs[]) {
+	if(strstr(src->codecs.rtpmap[VIDEO], "vp8") || strstr(src->codecs.rtpmap[VIDEO], "VP8"))
+		codecs[VIDEO] = "vp8";
+	else if(strstr(src->codecs.rtpmap[VIDEO], "vp9") || strstr(src->codecs.rtpmap[VIDEO], "VP9"))
+		codecs[VIDEO] = "vp9";
+	else if(strstr(src->codecs.rtpmap[VIDEO], "h264") || strstr(src->codecs.rtpmap[VIDEO], "H264"))
+		codecs[VIDEO] = "h264";
+
+	if(strstr(src->codecs.rtpmap[AUDIO], "opus") || strstr(src->codecs.rtpmap[AUDIO], "OPUS"))
+		codecs[AUDIO] = "opus";
+	else if(strstr(src->codecs.rtpmap[AUDIO], "pcm") || strstr(src->codecs.rtpmap[AUDIO], "PCM"))
+		codecs[AUDIO] = "g711";
+	else if(strstr(src->codecs.rtpmap[AUDIO], "g722") || strstr(src->codecs.rtpmap[AUDIO], "G722"))
+		codecs[AUDIO] = "g722";
+}
+
 static void cm_rtpbcast_generic_start_recording(
 		cm_rtpbcast_recorder *recorders[],	/* Array or pointer to recorders */
 		cm_rtpbcast_rtp_source *src,		/* Source */
@@ -3159,7 +3167,7 @@ static void cm_rtpbcast_generic_start_recording(
 		const char *id,						/* streamChannelKey */
 		const char *uid,					/* unique ID */
 		const char *types[],				/* Type labels, per recorder */
-		gboolean is_video[],				/* Whether stream is video, per recorder */
+		const char *codecs[],				/* Whether stream is video, per recorder */
 		const char *event_name				/* JSON event name for notification */
 ) {
 	/* FIXME @landswellsong which mutex we must lock? */
@@ -3202,7 +3210,7 @@ static void cm_rtpbcast_generic_start_recording(
 			fname = str_replace(fname, tags[k], values[k]);
 
 		cm_rtpbcast_recorder *recorder = g_malloc0(sizeof(cm_rtpbcast_recorder));
-		recorder->r = janus_recorder_create(cm_rtpbcast_settings.archive_path, is_video[j], fname);
+		recorder->r = janus_recorder_create(cm_rtpbcast_settings.archive_path, codecs[j], fname);
 		recorder->source = src;
 		recorder->had_keyframe = FALSE;
 		recorders[j] = recorder;
@@ -3297,16 +3305,19 @@ static void cm_rtpbcast_generic_stop_recording(
 }
 
 void cm_rtpbcast_start_recording(cm_rtpbcast_mountpoint *mnt, int source_index) {
-	gboolean is_video[] = { FALSE, TRUE };
+	char *codecs[] = { NULL, NULL };
+	cm_rtpbcast_rtp_source *src = g_array_index(mnt->sources, cm_rtpbcast_rtp_source *, source_index);
+	cm_rtpbcast_generic_get_codecs(src, codecs);
+	
 	cm_rtpbcast_generic_start_recording(
 		mnt->rc,
-		g_array_index(mnt->sources, cm_rtpbcast_rtp_source *, source_index),
+		src,
 		AUDIO, VIDEO,
 		cm_rtpbcast_settings.recording_pattern,
 		mnt->id,
 		mnt->uid,
 		av_names,
-		is_video,
+		(const char **)codecs,
 		"archive-finished"
 	);
 }
@@ -3324,17 +3335,20 @@ void cm_rtpbcast_stop_recording(cm_rtpbcast_mountpoint *mnt, int source_index) {
 }
 
 void cm_rtpbcast_start_thumbnailing(cm_rtpbcast_mountpoint *mnt, int source_index) {
-	gboolean is_video[] = { TRUE };
+	char *codecs[] = { NULL, NULL };
+	cm_rtpbcast_rtp_source *src = g_array_index(mnt->sources, cm_rtpbcast_rtp_source *, source_index);
+	cm_rtpbcast_generic_get_codecs(src, codecs);
+	
 	const char *types[] = { "thumb"};
 	cm_rtpbcast_generic_start_recording(
 		mnt->trc,
-		g_array_index(mnt->sources, cm_rtpbcast_rtp_source *, source_index),
+		src,
 		0, 0,
 		cm_rtpbcast_settings.thumbnailing_pattern,
 		mnt->id,
 		mnt->uid,
 		types,
-		is_video,
+		(const char **)&codecs[VIDEO],
 		"thumbnailing-finished"
 	);
 }
@@ -3396,7 +3410,7 @@ void cm_rtpbcast_mountpoint_destroy(gpointer data, gpointer user_data) {
 				if (session->source) {
 					session->source = NULL;
 					/* Tell the core to tear down the PeerConnection, hangup_media will do the rest */
-					gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event_text, NULL, NULL);
+					gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event, NULL);
 					gateway->close_pc(session->handle);
 				}
 				/* If the session was a repeater. Note this removes session from listeners so
@@ -3447,11 +3461,8 @@ void cm_rtpbcast_notify_session(gpointer data, gpointer user_data) {
 	if (!session || !event)
 		return;
 
-	char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
-	JANUS_LOG(LOG_VERB, "Pushing event: %s\n", event_text);
-	int ret = gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event_text, NULL, NULL);
-	JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
-	g_free(event_text);
+	int ret = gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event, NULL);
+        JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (%s)\n", ret, janus_get_api_error(ret));
 }
 
 void cm_rtpbcast_stop_udp_relays(cm_rtpbcast_session *session, cm_rtpbcast_rtp_source *srcmx) {
@@ -3558,10 +3569,11 @@ static void cm_rtpbcast_execute_switching(gpointer data, gpointer user_data) {
 		json_object_set_new(result, "streams", streams);
 
 		json_object_set_new(event, "result", result);
-		char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
-		json_decref(event);
 
-		gateway->push_event(sessid->handle, &cm_rtpbcast_plugin, NULL, event_text, NULL, NULL);
+		gateway->push_event(sessid->handle, &cm_rtpbcast_plugin, NULL, event, NULL);
+                
+		json_decref(event);
+                
 		janus_mutex_unlock(&oldsrc->mutex);
 	}
 	janus_mutex_unlock(&sessid->mutex);
